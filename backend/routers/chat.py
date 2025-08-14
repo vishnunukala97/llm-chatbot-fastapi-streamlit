@@ -7,6 +7,16 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 
 from ..schemas.chat import ChatIn, ChatOut
 from ..services.llm import LLMService, TransientLLMError
+from backend.core.exceptions import (
+    RateLimitException,
+    ProviderUnavailableException,
+    UpstreamTimeoutException,
+    ChatAPIException,
+    raise_for_status,
+)
+
+# Import limiter from main
+from backend.main import limiter
 
 log = logging.getLogger("routers.chat")
 router = APIRouter(tags=["chat"])
@@ -18,6 +28,7 @@ def get_llm_service(request: Request) -> LLMService:
     return svc
 
 @router.post("/chat", response_model=ChatOut, summary="Send a prompt and receive a model reply")
+@limiter.limit("10/minute")
 async def chat(payload: ChatIn, svc: LLMService = Depends(get_llm_service)) -> ChatOut:
     t0 = time.perf_counter()
     try:
@@ -26,22 +37,14 @@ async def chat(payload: ChatIn, svc: LLMService = Depends(get_llm_service)) -> C
         # Already mapped precisely in the service
         raise
     except RetryError as e:
-        # Retries exhausted: map the root cause
         last = e.last_attempt.exception()
         if isinstance(last, TransientLLMError):
             code = last.status_code
-            if code == 428:
-                raise HTTPException(status_code=429, detail="Rate limit from provider. Please retry shortly.")
-            if code in (503,):
-                raise HTTPException(status_code=503, detail="Provider overloaded/unavailable.")
-            if code in (504,):
-                raise HTTPException(status_code=504, detail="Upstream timeout.")
-            raise HTTPException(status_code=502, detail="Transient upstream error after retries.")
+            raise_for_status(code)
         if isinstance(last, httpx.TimeoutException):
-            raise HTTPException(status_code=504, detail="Upstream timeout.")
+            raise_for_status(504)
         if isinstance(last, httpx.HTTPError):
-            raise HTTPException(status_code=502, detail="Network error talking to provider.")
-        # Fallback
-        raise HTTPException(status_code=502, detail="Upstream error after retries.")
+            raise_for_status(502, "Network error talking to provider.")
+        raise_for_status(502, "Upstream error after retries.")
     latency_ms = int((time.perf_counter() - t0) * 1000)
     return ChatOut(reply=reply, latency_ms=latency_ms)

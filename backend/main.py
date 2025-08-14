@@ -12,6 +12,16 @@ from .core.logging import setup_logging
 from .routers.chat import router as chat_router
 from .services.llm import GeminiService
 
+# --- Rate limiting imports ---
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
+from fastapi.responses import JSONResponse
+
+# Initialize Limiter globally
+limiter = Limiter(key_func=get_remote_address)
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
@@ -41,6 +51,18 @@ async def lifespan(app: FastAPI):
         app.state.llm_service = None
 
 app = FastAPI(title="LLM Chatbot API", version="1.0.0", lifespan=lifespan)
+
+# Add SlowAPI middleware
+app.state.limiter = limiter
+app.add_middleware(SlowAPIMiddleware)
+
+# Add rate limit exception handler
+@app.exception_handler(RateLimitExceeded)
+async def rate_limit_handler(request, exc):
+    return JSONResponse(
+        status_code=429,
+        content={"detail": "Rate limit from provider—please retry shortly."},
+    )
 
 # CORS: allow Streamlit on localhost by default
 app.add_middleware(
