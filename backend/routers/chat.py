@@ -30,13 +30,12 @@ async def chat(payload: ChatIn, svc: LLMService = Depends(get_llm_service)) -> C
         last = e.last_attempt.exception()
         if isinstance(last, TransientLLMError):
             code = last.status_code
-            if code == 429:
+            if code == 428:
                 raise HTTPException(status_code=429, detail="Rate limit from provider. Please retry shortly.")
             if code in (503,):
                 raise HTTPException(status_code=503, detail="Provider overloaded/unavailable.")
             if code in (504,):
                 raise HTTPException(status_code=504, detail="Upstream timeout.")
-            # 500/502 or anything else transient after retries
             raise HTTPException(status_code=502, detail="Transient upstream error after retries.")
         if isinstance(last, httpx.TimeoutException):
             raise HTTPException(status_code=504, detail="Upstream timeout.")

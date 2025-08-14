@@ -44,7 +44,7 @@ if user_msg:
                     st.session_state.messages.append({"role": "assistant", "content": "Server error."})
             except requests.Timeout:
                 st.error("Timeout—please try again.")
-                st.session_state.messages.append({"role": "assistant", "content": "Timeout—please try again."})
+                st.session_state.messages.append({"role": "assistant", "content": "Timeout—please try again."})# hi
             except Exception as e:
                 st.error("Unexpected error.")
                 st.session_state.messages.append({"role": "assistant", "content": "Unexpected error."})
