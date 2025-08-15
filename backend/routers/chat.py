@@ -6,8 +6,10 @@ import httpx
 import time
 import html
 
+
+import logging
 router = APIRouter()
-log = setup_logging()
+log = logging.getLogger("chat")
 
 async def get_llm_client() -> LLMClient:
     async with httpx.AsyncClient() as client:
@@ -25,7 +27,7 @@ async def chat_endpoint(
         raise HTTPException(status_code=400, detail="Message cannot be empty.")
     start = time.perf_counter()
     try:
-        reply = await llm_client.generate_reply(user_message)
+        reply = await llm_client.generate_reply(user_message, provider=req.provider)
         latency = int((time.perf_counter() - start) * 1000)
         return ChatResponse(reply=reply, latency_ms=latency)
     except LLMAuthError as e:

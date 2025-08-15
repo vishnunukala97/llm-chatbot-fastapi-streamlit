@@ -52,25 +52,27 @@ def raise_llm_error(status_code: int, **kwargs) -> LLMError:
         return exc_class(kwargs.get("retry_after", 1.0))
     return exc_class(f"LLM error: status {status_code}")
 
+
 class LLMClient:
     """
     Abstraction for LLM providers (OpenAI, Gemini).
     """
     def __init__(self, http_client: httpx.AsyncClient):
         self.http_client = http_client
-        self.provider = settings.provider
         self.openai_key = settings.openai_api_key
         self.gemini_key = settings.gemini_api_key
         self.model = settings.openai_model
         self.timeout = settings.timeout_seconds
 
-    async def generate_reply(self, user_message: str) -> str:
-        if self.provider == "openai":
+    async def generate_reply(self, user_message: str, provider: str = None) -> str:
+        if provider is None:
+            provider = settings.provider
+        if provider == "openai":
             return await self._openai_reply(user_message)
-        elif self.provider == "gemini":
+        elif provider == "gemini":
             return await self._gemini_reply(user_message)
         else:
-            raise LLMUnknownError(f"Unknown provider: {self.provider}")
+            raise LLMUnknownError(f"Unknown provider: {provider}")
 
     async def _openai_reply(self, user_message: str) -> str:
         if not self.openai_key:
@@ -93,7 +95,8 @@ class LLMClient:
     async def _gemini_reply(self, user_message: str) -> str:
         if not self.gemini_key:
             raise LLMAuthError("Missing Gemini API key")
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key={self.gemini_key}"
+        # Use the latest Gemini 1.5 Pro endpoint and model name
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro-latest:generateContent?key={self.gemini_key}"
         headers = {"Content-Type": "application/json"}
         body = {
             "contents": [{"parts": [{"text": user_message}]}]
