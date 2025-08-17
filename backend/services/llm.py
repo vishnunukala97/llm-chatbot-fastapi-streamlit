@@ -1,48 +1,18 @@
 """
 LLMService (Gemini) — Production-Ready
 
-Covers Milestones 1, 2, and 3 in one place:
+Covers M1–M3:
+- M1: Clean API integration, timeout, basic error handling, server-side secrets
+- M2: Conversation history (per session_id), input validation/sanitization,
+      per-session rate limiting, request size budgets, error taxonomy
+- M3: Rich docstrings & type hints, structured logging, retries + backoff,
+      API key rotation, extensibility, optional telemetry (latency/usage),
+      and **JSON persistence** via backend/storage/json_store.py.
 
-M1 (Foundation & API):
-  - Loads config from env via pydantic-settings
-  - Integrates Google Gemini with timeouts
-  - Basic & friendly error handling
-  - Clean separation of concerns (service layer)
-
-M2 (Core Chat & Security):
-  - Per-session conversation history (optional, opt-in via session_id)
-  - Message validation (length, empties) + sanitization
-  - Rate limiting (simple token bucket, per session)
-  - Request size/length validation + history trimming (budget)
-  - Robust error taxonomy: invalid key, timeouts, rate limits, malformed response
-  - API key rotation (supports multiple keys via GEMINI_API_KEYS)
-
-M3 (Readiness & Quality):
-  - Detailed docstrings & type hints
-  - Structured logging (no secrets logged)
-  - Extensible design (swap model, add params, replace rate limiter / storage)
-  - Returns structured result (ChatResult) for richer telemetry when needed
-    while keeping `get_response()` backward-compatible (returns str)
-
-Expected environment variables (.env):
-  GEMINI_API_KEY=your_primary_key                 # or
-  GEMINI_API_KEYS=key1,key2,key3                  # rotation pool (overrides GEMINI_API_KEY)
-  GEMINI_MODEL=gemini-1.5-flash                   # default if unset (set in Settings)
-
-Usage (simple):
-  llm = LLMService()
-  text = llm.get_response("Hello")  # single-turn
-  # or with conversation context:
-  text = llm.get_response("Continue...", session_id="user-123")
-
-If you want richer metadata:
-  result = llm.chat("Hello", session_id="user-123")
-  print(result.reply, result.model, result.usage)
-
-NOTE:
-- This in-memory session history is for a single server process. If you run
-  multiple workers or want persistence beyond process lifetime, swap the
-  in-memory dict for Redis / database storage (interface stays the same).
+Usage:
+    llm = LLMService()
+    text = llm.get_response("Hello", session_id="abc123")        # simple text
+    result = llm.chat("Hello", session_id="abc123")              # rich metadata
 """
 
 from __future__ import annotations
@@ -59,29 +29,23 @@ from typing import Deque, Dict, List, Optional, Tuple
 import google.generativeai as genai
 
 from backend.core.config import settings
+from backend.storage.json_store import JSONStore
 
 
-# ------------------------------------------------------------------------------
-# Logging setup (app-wide logger is recommended; here we keep a service-specific one)
-# ------------------------------------------------------------------------------
+# ------------------------------ logging -------------------------------------
 logger = logging.getLogger("llm_service")
 if not logger.handlers:
-    # Basic sane defaults; in real deployments, prefer a JSON logger / structured logs
     handler = logging.StreamHandler()
-    formatter = logging.Formatter(
-        fmt="%(asctime)s | %(levelname)s | LLMService | %(message)s"
-    )
+    formatter = logging.Formatter("%(asctime)s | %(levelname)s | LLMService | %(message)s")
     handler.setFormatter(formatter)
     logger.addHandler(handler)
 logger.setLevel(logging.INFO)
 
 
-# ------------------------------------------------------------------------------
-# Public data types
-# ------------------------------------------------------------------------------
+# --------------------------- public result type ------------------------------
 @dataclass
 class ChatResult:
-    """Rich result object for production telemetry and UI metadata."""
+    """Rich result for telemetry/analytics while keeping simple text available."""
     reply: str
     model: str
     total_history_turns: int
@@ -91,15 +55,37 @@ class ChatResult:
     from_cache: bool = False  # reserved for future optimization
 
 
-# ------------------------------------------------------------------------------
-# Internal helpers: rate limiting & error taxonomy
-# ------------------------------------------------------------------------------
+# ------------------------------- errors --------------------------------------
+class LLMServiceError(Exception):
+    """Base exception for LLM service errors."""
+
+
+class InvalidAPIKeyError(LLMServiceError):
+    """Raised when API key is invalid / unauthorized."""
+
+
+class RateLimitError(LLMServiceError):
+    """Raised when rate limit is exceeded."""
+
+
+class TimeoutError(LLMServiceError):
+    """Raised when request times out."""
+
+
+class MalformedResponseError(LLMServiceError):
+    """Raised when response is missing expected data."""
+
+
+class ValidationError(LLMServiceError):
+    """Raised when inputs are invalid."""
+
+
+# ---------------------------- rate limiter -----------------------------------
 class TokenBucket:
     """
-    Simple token bucket for per-session rate limiting.
-    - capacity: max tokens in bucket
-    - refill_rate: tokens per second
-    - consume(n): returns True if enough tokens; otherwise False
+    Simple per-session token bucket rate limiter.
+    capacity: max tokens
+    refill_rate: tokens per second
     """
 
     def __init__(self, capacity: int, refill_rate: float) -> None:
@@ -123,64 +109,38 @@ class TokenBucket:
         return False
 
 
-class LLMServiceError(Exception):
-    """Base exception for LLM service errors."""
-
-
-class InvalidAPIKeyError(LLMServiceError):
-    """Raised when API key is invalid / unauthorized."""
-
-
-class RateLimitError(LLMServiceError):
-    """Raised when rate limit is exceeded."""
-
-
-class TimeoutError(LLMServiceError):
-    """Raised when request times out."""
-
-
-class MalformedResponseError(LLMServiceError):
-    """Raised when response is missing expected data."""
-
-
-class ValidationError(LLMServiceError):
-    """Raised when inputs are invalid (length, empties, etc.)."""
-
-
-# ------------------------------------------------------------------------------
-# Main Service
-# ------------------------------------------------------------------------------
+# ------------------------------- service -------------------------------------
 class LLMService:
     """
-    Production-ready Gemini client wrapper with:
-      - input validation & sanitization
-      - optional conversation history per session_id
-      - rate limiting (per session)
-      - retries + exponential backoff for transient errors
-      - API key rotation support
+    Gemini wrapper with:
+      - input validation/sanitization
+      - per-session history + rate limiting
+      - retries + exponential backoff
+      - API key rotation
       - structured logging
+      - optional JSON persistence
     """
 
-    # ---- Sensible defaults (override via constructor if needed) ----
+    # Tunables / sensible defaults
     DEFAULT_MODEL = settings.gemini_model
     TIMEOUT_S = 20
     MAX_OUTPUT_TOKENS = 512
     TEMPERATURE = 0.4
     TOP_P = 0.95
 
-    # Validation limits (keep UI/responses snappy)
+    # Validation limits
     MAX_MESSAGE_CHARS = 4000
-    MAX_HISTORY_TURNS = 16  # total turns kept (user + model); keep small for latency
-    MAX_HISTORY_CHARS = 16000  # safety budget for combined history
+    MAX_HISTORY_TURNS = 16        # user+model turns kept
+    MAX_HISTORY_CHARS = 16000     # overall budget
 
-    # Rate limiting: ~30 messages per minute per session
+    # Per-session rate: ~30/min (token bucket)
     RL_CAPACITY = 30
-    RL_REFILL_RATE = 0.5  # tokens/sec == 30/min
+    RL_REFILL_RATE = 0.5          # tokens per second
 
     # Retry policy
     RETRIES = 3
-    BACKOFF_BASE = 0.4  # seconds
-    BACKOFF_JITTER = 0.25  # random jitter added
+    BACKOFF_BASE = 0.4            # seconds
+    BACKOFF_JITTER = 0.25         # seconds
 
     def __init__(self,
                  model: Optional[str] = None,
@@ -188,49 +148,51 @@ class LLMService:
                  temperature: Optional[float] = None,
                  top_p: Optional[float] = None,
                  max_output_tokens: Optional[int] = None) -> None:
-        # ---- Config & model selection ----
+        """
+        Constructor: sets model/config, loads key(s), prepares session state,
+        configures the Gemini SDK, and builds the model handle.
+        """
+        # ---- Model & generation config ----
         self.model_name = (model or self.DEFAULT_MODEL).strip()
-
         self.timeout_s = timeout_s or self.TIMEOUT_S
         self.temperature = self.TEMPERATURE if temperature is None else temperature
         self.top_p = self.TOP_P if top_p is None else top_p
         self.max_output_tokens = max_output_tokens or self.MAX_OUTPUT_TOKENS
 
-        # ---- API keys & rotation pool ----
-        # Supports GEMINI_API_KEYS="k1,k2,..." or fallback to GEMINI_API_KEY
-        keys_raw = (getattr(settings, "gemini_api_key", None) or "").strip()
-        keys_pool_raw = (getattr(settings, "gemini_api_keys", None)
-                         if hasattr(settings, "gemini_api_keys") else None)
-
-        if keys_pool_raw:
-            # If you prefer multiple keys, add this to your Settings model and .env
-            # GEMINI_API_KEYS=key1,key2,key3
-            pool = [k.strip() for k in str(keys_pool_raw).split(",") if k.strip()]
+        # ---- API keys (supports rotation) ----
+        single = (settings.gemini_api_key or "").strip()
+        pool_raw = (settings.gemini_api_keys or None)
+        if pool_raw:
+            pool = [k.strip() for k in str(pool_raw).split(",") if k.strip()]
         else:
-            pool = [k for k in [keys_raw] if k]
-
+            pool = [k for k in [single] if k]
         if not pool:
             raise InvalidAPIKeyError("No Gemini API key(s) provided in environment.")
 
         self._keys: List[str] = pool
         self._key_index = 0
-        self._lock = RLock()  # guard key rotation & shared maps
+        self._lock = RLock()
 
-        # ---- In-memory per-session state ----
-        # Map session_id -> deque of {"role": "user"|"model", "content": "..."}
+        # ---- Per-session in-memory state ----
         self._history: Dict[str, Deque[Dict[str, str]]] = {}
-        # Map session_id -> TokenBucket
         self._buckets: Dict[str, TokenBucket] = {}
 
-        # ---- Initialize SDK once with the first key ----
+        # ---- NEW: optional JSON persistence (one file per session) ----
+        # Enabled when settings.persist_history == True
+        # Files live under settings.data_dir / "sessions"
+        self._store: JSONStore | None = JSONStore(settings.data_dir) if settings.persist_history else None
+
+        # ---- Configure SDK & create model handle ----
         with self._lock:
             genai.configure(api_key=self._current_key())
             self._model = self._make_model()
 
-        logger.info("LLMService initialized (model=%s, keys=%d)",
-                    self.model_name, len(self._keys))
+        logger.info(
+            "LLMService ready (model=%s, keys=%d, persist=%s, data_dir=%s)",
+            self.model_name, len(self._keys), bool(self._store), getattr(settings, "data_dir", "data")
+        )
 
-    # -------------------------- Public API --------------------------
+    # ---------------------------- public API ---------------------------------
 
     def get_response(self,
                      message: str,
@@ -238,25 +200,19 @@ class LLMService:
                      session_id: Optional[str] = None,
                      system_instruction: Optional[str] = None) -> str:
         """
-        Backward-compatible method that returns only the reply text and
-        never raises errors — converts them to friendly strings.
-
-        For richer metadata and explicit error handling, use `chat(...)` instead.
+        Backward-compatible: returns text only and never raises.
+        Converts typed errors to friendly strings.
         """
         try:
-            result = self.chat(
-                message=message,
-                session_id=session_id,
-                system_instruction=system_instruction
-            )
+            result = self.chat(message, session_id=session_id, system_instruction=system_instruction)
             return result.reply
         except ValidationError as e:
             logger.warning("Validation error: %s", e)
-            return str(e)  # user-friendly message already
+            return str(e)
         except InvalidAPIKeyError:
-            return "Authentication failed: invalid API key. Please check your configuration."
+            return "Authentication failed: invalid API key. Please check configuration."
         except RateLimitError:
-            return "I’m receiving too many requests right now. Please wait a moment and try again."
+            return "Too many requests right now. Please wait and try again."
         except TimeoutError:
             return "The request to the AI model timed out. Please retry."
         except MalformedResponseError:
@@ -274,44 +230,40 @@ class LLMService:
              top_p: Optional[float] = None,
              max_output_tokens: Optional[int] = None) -> ChatResult:
         """
-        Production-grade entrypoint.
-        - Validates & sanitizes input
-        - Applies per-session rate limiting
-        - Adds conversation context when `session_id` is provided
-        - Retries transient failures with exponential backoff
-        - Rotates API keys on auth/rate-limit when possible
-        - Returns a rich ChatResult
-        - May raise typed LLMServiceError subclasses for fine-grained handling
+        Main entrypoint with typed errors + telemetry.
+        - Validates & sanitizes the input
+        - Applies per-session rate limit
+        - Loads prior history (from memory or JSON) and appends the new user turn
+        - Calls Gemini with retries/backoff; rotates API keys if helpful
+        - Persists history after success if persistence is enabled
         """
-        # 1) Validate & sanitize
+        # 1) validate & sanitize
         user_text = self._sanitize(self._validate_message(message))
 
-        # 2) Rate limit (only if we can identify a session)
-        if session_id is not None:
-            if not self._check_rate_limit(session_id):
-                raise RateLimitError("Too many requests. Slow down and try again.")
-        # 3) Build contents with (optional) history
+        # 2) per-session rate limit
+        if session_id is not None and not self._check_rate_limit(session_id):
+            raise RateLimitError("Too many requests. Slow down and try again.")
+
+        # 3) contents (history + new user turn)
         contents = self._build_contents(user_text, session_id=session_id)
 
-        # 4) Generation options
+        # 4) generation config
         gen_config = {
             "temperature": self.temperature if temperature is None else temperature,
             "top_p": self.top_p if top_p is None else top_p,
             "max_output_tokens": self.max_output_tokens if max_output_tokens is None else max_output_tokens,
         }
 
-        # 5) Call model with retries + key rotation
+        # 5) call with retries
         start = time.time()
         last_exc: Optional[Exception] = None
 
         for attempt in range(1, self.RETRIES + 1):
             try:
-                # If system_instruction is provided, build a temporary model with it
                 model = self._model
                 if system_instruction:
                     model = genai.GenerativeModel(self.model_name, system_instruction=system_instruction)
 
-                # Gemini call
                 resp = model.generate_content(
                     contents=contents,
                     generation_config=gen_config,
@@ -324,12 +276,10 @@ class LLMService:
 
                 latency_ms = int((time.time() - start) * 1000)
 
-                # 6) Update history after successful call
                 total_turns = self._update_history_after_success(
                     session_id=session_id, user_text=user_text, reply_text=reply
                 )
 
-                # Try to capture basic usage metadata if available
                 usage = None
                 try:
                     um = getattr(resp, "usage_metadata", None)
@@ -340,10 +290,9 @@ class LLMService:
                             "total_characters": getattr(um, "total_characters", None),
                         }
                 except Exception:
-                    # Best-effort; ignore if SDK fields change
                     usage = None
 
-                logger.info("Gemini call success (session=%s, latency_ms=%s, attempt=%d)",
+                logger.info("Gemini success (session=%s, latency_ms=%s, attempt=%d)",
                             session_id, latency_ms, attempt)
 
                 return ChatResult(
@@ -357,32 +306,23 @@ class LLMService:
 
             except Exception as e:
                 last_exc = e
-                # Categorize and decide if we should retry or rotate key
                 action, classification = self._classify_error(e)
-                logger.warning("Gemini call error (attempt=%d/%d, class=%s, action=%s, session=%s): %s",
+                logger.warning("Gemini error (attempt=%d/%d, class=%s, action=%s, session=%s): %s",
                                attempt, self.RETRIES, classification, action, session_id, e)
 
                 if action == "rotate_key":
-                    # Attempt key rotation if pool > 1
-                    if not self._rotate_key():
-                        # no other keys available — fall back to retry/backoff if marked transient
-                        pass
-                    else:
-                        # reconfigure the SDK with the new key
+                    if self._rotate_key():
                         with self._lock:
                             genai.configure(api_key=self._current_key())
                             self._model = self._make_model()
 
                 if action in ("retry", "rotate_key_retry"):
-                    # exponential backoff with jitter
-                    sleep_s = self._backoff_time(attempt)
-                    time.sleep(sleep_s)
+                    time.sleep(self._backoff_time(attempt))
                     continue
 
-                # Do not retry for non-retryable errors
-                break
+                break  # non-retryable
 
-        # If we reach here, all attempts failed — raise the most appropriate error
+        # all attempts failed → raise typed error
         assert last_exc is not None
         _, classification = self._classify_error(last_exc)
 
@@ -397,27 +337,32 @@ class LLMService:
         if classification == "validation":
             raise ValidationError(str(last_exc))
 
-        # Unknown/other
         raise LLMServiceError(str(last_exc))
 
-    # ----------------------- Session & History API -----------------------
+    # --------------------- session & history helpers --------------------------
 
     def clear_session(self, session_id: str) -> None:
-        """Remove conversation history and rate limiter state for a session."""
+        """Clear history and rate limiter for a session (memory + JSON)."""
         with self._lock:
             self._history.pop(session_id, None)
             self._buckets.pop(session_id, None)
+        if self._store is not None:
+            self._store.clear(session_id)
 
     def get_history(self, session_id: str) -> List[Dict[str, str]]:
-        """Return a copy of the current history for inspection/testing."""
+        """Return a copy of session history (lazy-hydrates from JSON if empty)."""
         with self._lock:
-            dq = self._history.get(session_id, deque())
-            return list(dq)
+            dq = self._history.get(session_id)
+            if dq is None and self._store is not None:
+                # Lazy hydrate from disk
+                disk_msgs = self._store.load(session_id)
+                dq = deque(disk_msgs)
+                self._history[session_id] = dq
+            return list(dq or [])
 
-    # ----------------------- Internal helpers -----------------------
+    # --------------------------- internals -----------------------------------
 
     def _validate_message(self, message: str) -> str:
-        """Basic validation for empty/oversized messages."""
         if message is None:
             raise ValidationError("Message cannot be null.")
         msg = str(message).strip()
@@ -429,15 +374,10 @@ class LLMService:
 
     @staticmethod
     def _sanitize(text: str) -> str:
-        """
-        Remove control chars that can cause logging/transport issues.
-        (UI XSS is usually handled by the front-end renderer, but stripping
-        non-printable ASCII here is still good hygiene.)
-        """
+        # Remove non-printable control chars (defense-in-depth)
         return re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]", " ", text)
 
     def _check_rate_limit(self, session_id: str) -> bool:
-        """Consume 1 token; return False if over the limit."""
         with self._lock:
             bucket = self._buckets.get(session_id)
             if bucket is None:
@@ -448,43 +388,43 @@ class LLMService:
     def _build_contents(self, user_text: str, *, session_id: Optional[str]) -> List[Dict[str, object]]:
         """
         Build Gemini 'contents' array, optionally including past turns.
-        Gemini expects roles 'user' and 'model'.
+        - Lazy hydration from JSON if memory has no history.
+        - Enforce rough character budget by dropping oldest turns.
         """
         contents: List[Dict[str, object]] = []
 
         if session_id is not None:
             with self._lock:
                 dq = self._history.get(session_id)
+                # Lazy hydrate from disk if in-memory history absent
+                if dq is None and self._store is not None:
+                    disk_msgs = self._store.load(session_id)
+                    dq = deque(disk_msgs)
+                    self._history[session_id] = dq
+
                 if dq:
-                    # Copy current history (already trimmed by _update_history_after_success)
                     for m in dq:
                         contents.append({"role": m["role"], "parts": [m["content"]]})
 
         # Append the new user message
         contents.append({"role": "user", "parts": [user_text]})
 
-        # Final safety budget: if total chars exceed MAX_HISTORY_CHARS, drop from the front.
+        # Enforce a rough budget (drop oldest if oversized)
         total_chars = sum(len("".join(msg.get("parts", []))) for msg in contents)
         if total_chars > self.MAX_HISTORY_CHARS:
-            # Trim oldest history messages (not the last user message)
             i = 0
             while i < len(contents) - 1 and total_chars > self.MAX_HISTORY_CHARS:
-                # compute length of ith message
                 msg_len = len("".join(contents[i].get("parts", [])))
                 total_chars -= msg_len
                 i += 1
-            contents = contents[i:]  # drop oldest i messages
+            contents = contents[i:]
 
         return contents
 
-    def _update_history_after_success(self,
-                                      *,
-                                      session_id: Optional[str],
-                                      user_text: str,
-                                      reply_text: str) -> int:
+    def _update_history_after_success(self, *, session_id: Optional[str], user_text: str, reply_text: str) -> int:
         """
         After a successful generation, append (user, model) to session history
-        and enforce max turns + budgets.
+        and enforce max turns + budgets. Persist to JSON if enabled.
         """
         if session_id is None:
             return 0
@@ -495,7 +435,6 @@ class LLMService:
                 dq = deque()
                 self._history[session_id] = dq
 
-            # Append user and model turns
             dq.append({"role": "user", "content": user_text})
             dq.append({"role": "model", "content": reply_text})
 
@@ -510,13 +449,21 @@ class LLMService:
             while total_chars() > self.MAX_HISTORY_CHARS and dq:
                 dq.popleft()
 
-            return len(dq)
+            total = len(dq)
+
+            # Persist to JSON if enabled
+            if self._store is not None:
+                try:
+                    self._store.save(session_id, list(dq))
+                except Exception as e:
+                    logger.warning("Failed to persist session '%s': %s", session_id, e)
+
+            return total
 
     def _current_key(self) -> str:
         return self._keys[self._key_index]
 
     def _rotate_key(self) -> bool:
-        """Rotate to the next API key if available; return True if changed."""
         with self._lock:
             if len(self._keys) <= 1:
                 return False
@@ -525,31 +472,26 @@ class LLMService:
             return True
 
     def _make_model(self):
-        """Create a GenerativeModel instance for the current model name."""
         return genai.GenerativeModel(self.model_name)
 
     def _backoff_time(self, attempt: int) -> float:
-        """Exponential backoff with jitter."""
         base = self.BACKOFF_BASE * (2 ** (attempt - 1))
         jitter = random.uniform(0, self.BACKOFF_JITTER)
         return base + jitter
 
     def _classify_error(self, exc: Exception) -> Tuple[str, str]:
         """
-        Map exceptions to (action, classification):
-
+        Map exceptions to (action, classification).
         action:
-          - 'retry'              -> transient network/timeout
-          - 'rotate_key_retry'   -> likely key-related or rate-limit; try rotating & retry
-          - 'fail'               -> do not retry
-
+          - 'retry'              → transient network/timeout
+          - 'rotate_key_retry'   → key/rate-limit; try rotating & retry
+          - 'rotate_key'         → rotate only, then decide
+          - 'fail'               → do not retry
         classification:
           - 'invalid_key' | 'rate_limit' | 'timeout' | 'malformed' | 'validation' | 'other'
         """
         msg = str(exc).lower()
 
-        # NOTE: The google SDK error classes may vary by version.
-        # We conservatively inspect message text to avoid hard dependencies.
         if "unauthorized" in msg or "401" in msg or "invalid api key" in msg or "permission denied" in msg:
             return "rotate_key_retry", "invalid_key"
 
@@ -565,7 +507,6 @@ class LLMService:
         if isinstance(exc, MalformedResponseError):
             return "retry", "malformed"
 
-        # Unknown — treat as non-retryable unless it smells transient
         if "temporarily unavailable" in msg or "try again" in msg or "reset" in msg:
             return "retry", "other"
 

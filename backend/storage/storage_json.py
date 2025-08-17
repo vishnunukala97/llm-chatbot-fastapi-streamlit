@@ -16,6 +16,7 @@ Schema (per file):
 """
 
 from __future__ import annotations
+
 import json
 import os
 import re
@@ -23,7 +24,7 @@ import tempfile
 import time
 from pathlib import Path
 from threading import RLock
-from typing import List, Dict
+from typing import Dict, List
 
 
 class JSONStore:
@@ -42,7 +43,7 @@ class JSONStore:
 
     def load(self, session_id: str) -> List[Dict[str, str]]:
         """
-        Load a session history. Returns [] if missing.
+        Load a session history. Returns [] if missing or unreadable.
         """
         path = self._session_path(session_id)
         if not path.exists():
@@ -51,7 +52,7 @@ class JSONStore:
             try:
                 with path.open("r", encoding="utf-8") as f:
                     data = json.load(f)
-                # Basic shape check
+                # Basic shape check & normalization
                 if not isinstance(data, list):
                     return []
                 return [
@@ -66,22 +67,25 @@ class JSONStore:
     def save(self, session_id: str, messages: List[Dict[str, str]]) -> None:
         """
         Atomically save the full history for a session.
+        - Writes to a temporary file then renames → atomic within the same filesystem.
         """
         path = self._session_path(session_id)
         with self._lock:
-            # Enrich with timestamps (optional, helps later debugging/analytics)
+            # Enrich with timestamps (useful for later analytics/debugging)
             payload = [
                 {"role": m["role"], "content": m["content"], "ts": time.time()}
                 for m in messages
             ]
-            # Write to a temp file, then replace — atomic on the same filesystem
-            tmp_fd, tmp_path = tempfile.mkstemp(dir=str(self.sessions_dir), prefix="sess_", suffix=".json")
+            # Write to temp file first
+            tmp_fd, tmp_path = tempfile.mkstemp(
+                dir=str(self.sessions_dir), prefix="sess_", suffix=".json"
+            )
             try:
                 with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
                     json.dump(payload, f, ensure_ascii=False, indent=2)
                 os.replace(tmp_path, path)
             finally:
-                # Ensure temp file is gone if os.replace failed early
+                # Ensure temp file is gone if replace failed early
                 if os.path.exists(tmp_path):
                     try:
                         os.remove(tmp_path)
@@ -90,7 +94,7 @@ class JSONStore:
 
     def clear(self, session_id: str) -> None:
         """
-        Delete the session file if present.
+        Delete the session file if present (best-effort).
         """
         path = self._session_path(session_id)
         with self._lock:
@@ -98,7 +102,6 @@ class JSONStore:
                 try:
                     path.unlink()
                 except Exception:
-                    # Best-effort: ignore deletion failures
                     pass
 
     # ------------------------ internal helpers ----------------------
@@ -109,11 +112,9 @@ class JSONStore:
         """
         Sanitize session_id for filename use (defense-in-depth).
         """
-        sid = session_id.strip()
-        if not sid:
-            sid = "anonymous"
-        # Replace unsafe chars with underscore
-        return self._SAFE_RE.sub("_", sid)[:128]  # guard excessive length
+        sid = session_id.strip() or "anonymous"
+        # Replace unsafe chars with underscore and cap length
+        return self._SAFE_RE.sub("_", sid)[:128]
 
     def _session_path(self, session_id: str) -> Path:
         return self.sessions_dir / f"{self._safe_name(session_id)}.json"
