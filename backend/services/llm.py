@@ -29,7 +29,7 @@ from typing import Deque, Dict, List, Optional, Tuple
 import google.generativeai as genai
 
 from backend.core.config import settings
-from backend.storage.json_store import JSONStore
+from backend.storage.storage_json import JSONStore
 
 
 # ------------------------------ logging -------------------------------------

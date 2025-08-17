@@ -13,7 +13,7 @@ Security:
 from typing import List, Optional
 from fastapi import FastAPI, Header
 from pydantic import BaseModel, Field
-from backend.services.llm_service import LLMService
+from backend.services.llm import LLMService
 
 app = FastAPI(title="Basic LLM Chatbot (Gemini)")
 llm = LLMService()  # single instance reused across requests
