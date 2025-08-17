@@ -1,11 +1,29 @@
-import logging, sys
-from .config import settings
+import logging
+import sys
+import json
+from typing import Any
 
-def setup_logging() -> None:
+class JsonFormatter(logging.Formatter):
+    """
+    Logging formatter to output logs as JSON for console/uvicorn compatibility.
+    """
+    def format(self, record: logging.LogRecord) -> str:
+        log_record = {
+            "level": record.levelname,
+            "time": self.formatTime(record, self.datefmt),
+            "name": record.name,
+            "message": record.getMessage(),
+        }
+        if record.exc_info:
+            log_record["exc_info"] = self.formatException(record.exc_info)
+        return json.dumps(log_record)
+
+def setup_logging(level: int = logging.INFO) -> None:
+    """
+    Configure root logger to output JSON logs to stdout (uvicorn-compatible).
+    """
     handler = logging.StreamHandler(sys.stdout)
-    fmt = "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
-    handler.setFormatter(logging.Formatter(fmt))
+    handler.setFormatter(JsonFormatter())
     root = logging.getLogger()
-    root.handlers.clear()
-    root.addHandler(handler)
-    root.setLevel(settings.LOG_LEVEL)
+    root.handlers = [handler]
+    root.setLevel(level)

@@ -1,8 +1,11 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, constr
 
-class ChatIn(BaseModel):
-    message: str = Field(..., min_length=1, max_length=5000)
+from typing import Literal
 
-class ChatOut(BaseModel):
+class ChatRequest(BaseModel):
+    message: constr(min_length=1, max_length=2000)
+    provider: Literal["openai", "gemini"]
+
+class ChatResponse(BaseModel):
     reply: str
     latency_ms: int
