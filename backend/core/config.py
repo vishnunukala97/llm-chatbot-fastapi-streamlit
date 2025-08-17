@@ -1,22 +1,28 @@
+"""
+Purpose:
+- Central place to read configuration from environment variables.
+- Uses pydantic-settings so we get validation + defaults.
+- Keeps secrets OUT of code. You store them in .env (which is .gitignored).
+
+How it works:
+- When `Settings()` is created, it loads values from `.env` automatically.
+- We expose a singleton `settings` you can import anywhere.
+"""
+
 from pydantic_settings import BaseSettings
-from pydantic import Field
-from typing import Literal
+
 
 class Settings(BaseSettings):
-    """
-    Application configuration loaded from environment variables or .env file.
-    """
-    provider: Literal["openai", "gemini"] = Field("openai", env="PROVIDER")
-    openai_api_key: str = Field("", env="OPENAI_API_KEY")
-    gemini_api_key: str = Field("", env="GEMINI_API_KEY")
-    backend_host: str = Field("127.0.0.1", env="BACKEND_HOST")
-    backend_port: int = Field(8000, env="BACKEND_PORT")
-    openai_model: str = Field("gpt-4o-mini", env="OPENAI_MODEL")
-    timeout_seconds: int = Field(30, env="TIMEOUT_SECONDS")
-    rate_limit_qps: int = Field(2, env="RATE_LIMIT_QPS")
+    # Your Google Gemini API key (required). If missing, pydantic will raise an error
+    gemini_api_key: str
+
+    # Which Gemini model to use; safe default is flash for speed
+    gemini_model: str = "gemini-1.5-flash"
 
     class Config:
+        # Tell pydantic to read from this file by default
         env_file = ".env"
-        env_file_encoding = "utf-8"
 
+
+# Create a single shared instance you can import
 settings = Settings()
